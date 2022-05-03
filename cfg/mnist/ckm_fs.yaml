@@ -1,0 +1,23 @@
+base_cfg: cfg/mnist/common.yaml
+clustering: CKMFS
+ae:
+  encoder:
+    - 1024
+    - 512
+    - 256
+  decoder:
+    - 256
+    - 512
+    - 1024
+ckm:
+  tau_min: 1e-3
+  tau_max: 1e3
+  tau_sched: exponential
+  reg_lamba: 1e-2
+stg:
+  sigma: 0.5
+  reg_lamba: 0.1
+  hidden_dim: 64
+  start_reg_after_epoch: 500
+  lr: 5e-1
+
