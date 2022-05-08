@@ -11,8 +11,11 @@ ae:
     - 1024
 stg:
   sigma: 0.5
-  reg_lamba: 0.1
+  reg_lamba: 1.
   hidden_dim: 64
-  start_reg_after_epoch: 500
+  start_reg_after_epoch: 100
   lr: 5e-1
 
+ckm:
+  reg_lamba: 1e-2
+  centroid_dim: 10

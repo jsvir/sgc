@@ -1,0 +1,5 @@
+base_cfg: cfg/mnist/common.yaml
+clustering: CKMShallow
+ckm:
+  reg_lamba: 1
+  centroid_dim: 784

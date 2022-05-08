@@ -51,7 +51,7 @@ class RBFLayer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.n_clusters = cfg.n_clusters
-        self.in_features = cfg.n_clusters
+        self.in_features = cfg.ckm.centroid_dim
         self.out_features = cfg.n_clusters
         self._centroids = nn.Parameter(torch.Tensor(self.out_features, self.in_features), requires_grad=True)
         self.sigmas = nn.Parameter(torch.Tensor(self.out_features), requires_grad=True)
@@ -113,6 +113,67 @@ class STGLayer(torch.nn.Module):
     def regularization(self, h):
         return self.reg_lamba * torch.mean(0.5 - 0.5 * torch.erf((-1 / 2 - h) / (self.sigma * self._sqrt_2)))
 
+    def num_open_gates(self, x, reduction='mean'):
+        with torch.no_grad():
+            gates = self.hard_sigmoid(self.net(x) + self.sigma)
+        if reduction == 'mean':
+            return gates.mean()
+        elif reduction == 'sum':
+            return gates.sum()
+
+
+class STGLayerAE(torch.nn.Module):
+    " Feature selection layer as in the paper: https://arxiv.org/abs/2106.06468"
+
+    def __init__(self, cfg):
+        super(STGLayerAE, self).__init__()
+        self._sqrt_2 = math.sqrt(2)
+        self.sigma = cfg.stg.sigma
+        self.reg_lamba = cfg.stg.reg_lamba
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(cfg.input_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+        )
+        self.out_layer = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(256, cfg.input_dim),
+            nn.Tanh())
+
+        self.decoder = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, cfg.input_dim),
+        )
+
+    def forward(self, x, train=False):
+        noise = torch.randn_like(x, device=x.device)
+        h1 = self.net(x)
+        h = self.out_layer(h1)
+        recon_x = self.decoder(h1)
+        z = h + self.sigma * noise * train
+        stochastic_gate = self.hard_sigmoid(z)
+        gated_x = x * stochastic_gate
+        return gated_x, h, recon_x
+
+    def hard_sigmoid(self, x):
+        return torch.clamp(x + 0.5, 0.0, 1.0)
+
+    def regularization(self, h):
+        return self.reg_lamba * torch.mean(0.5 - 0.5 * torch.erf((-1 / 2 - h) / (self.sigma * self._sqrt_2)))
+
+    def num_open_gates(self, x, reduction='mean'):
+        gates = self.hard_sigmoid(self.net(x) + self.sigma)
+        if reduction == 'mean':
+            return gates.mean()
+        elif reduction == 'sum':
+            return gates.sum()
+
 
 class Gumble_Softmax(nn.Module):
     def __init__(self, tau, straight_through=False):
@@ -148,3 +209,96 @@ class SubspaceClusterNetwork(nn.Module):
         z = F.normalize(z, p=2)
         return z, logits
 
+
+class ClusterLayer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = nn.Sequential(
+            DenseBlock(cfg.n_clusters, cfg.cluster[0]),
+            nn.Linear(cfg.cluster[0], cfg.n_clusters)
+        )
+
+    def forward(self, z):
+        logits = self.layers(z)
+        z = F.normalize(z, p=2)
+        return z, logits
+
+
+class DimReduction(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layer = nn.Linear(cfg.input_dim, cfg.n_clusters, bias=False)
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+class SelectLayer(nn.Module):
+    """ from github.com/jsvir/lscae"""
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.input_features = self.cfg.input_dim
+        self.output_features = self.cfg.selector.k_selected
+        self.num_epochs = self.cfg.trainer.max_epochs
+        self.start_temp = self.cfg.selector.start_temp
+        self.min_temp = self.cfg.selector.min_temp
+        self.logits = torch.nn.Parameter(torch.zeros(self.input_features, self.output_features), requires_grad=True)
+
+    def current_temp(self, epoch, sched_type='exponential'):
+        schedules = {
+            'exponential': max(self.min_temp, self.start_temp * ((self.min_temp / self.start_temp) ** (epoch / self.num_epochs))),
+            'linear': max(self.min_temp, self.start_temp - (self.start_temp - self.min_temp) * (epoch / self.num_epochs)),
+            'cosine': self.min_temp + 0.5 * (self.start_temp - self.min_temp) * (1. + math.cos(epoch * math.pi / self.num_epochs))
+        }
+        return schedules[sched_type]
+
+    def forward(self, x, epoch=None):
+        from torch.distributions.uniform import Uniform
+        uniform_pdfs = Uniform(low=1e-6, high=1.).sample(self.logits.size()).to(x.device)
+        gumbel = -torch.log(-torch.log(uniform_pdfs))
+
+        if self.training:
+            temp = self.current_temp(epoch)
+            noisy_logits = (self.logits + gumbel) / temp
+            weights = F.softmax(noisy_logits / temp, dim=0)
+            x = x @ weights
+        else:
+            weights = F.one_hot(torch.argmax(self.logits, dim=0), self.input_features).float()
+            x = x @ weights.T
+        return x, weights
+
+    def get_weights(self, epoch):
+        temp = self.current_temp(epoch)
+        return F.softmax(self.logits / temp, dim=0)
+
+    def get_selected_feats(self):
+        feats = torch.argmax(self.logits, dim=0)
+        return feats
+
+class Decoder(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.input_features = cfg.selector.k_selected
+        self.output_features = cfg.input_dim
+        self.hidden_dim = cfg.selector.hidden_dim
+
+        self.layer1 = torch.nn.Sequential(
+            torch.nn.Linear(self.input_features, self.hidden_dim, bias=False),
+            torch.nn.BatchNorm1d(self.hidden_dim),
+            torch.nn.LeakyReLU(.2, True),
+        )
+        self.layer2 = torch.nn.Sequential(
+            torch.nn.Linear(self.hidden_dim, self.hidden_dim, bias=False),
+            torch.nn.BatchNorm1d(self.hidden_dim),
+            torch.nn.LeakyReLU(.2, True),
+        )
+        self.layer3 = torch.nn.Sequential(
+            torch.nn.Linear(self.hidden_dim, self.output_features, bias=True),
+        )
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        return x

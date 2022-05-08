@@ -9,4 +9,6 @@ ae:
     - 256
     - 512
     - 1024
-
+ckm:
+  reg_lamba: 1e-2
+  centroid_dim: 10

@@ -1,11 +1,20 @@
 base_cfg: cfg/mnist/common.yaml
-clustering: CMRR
+clustering: MCRR
 ae:
   encoder:
     - 1024
     - 512
     - 256
+  decoder:
+    - 256
+    - 512
+    - 1024
+cluster:
+    - 1024
+
 mcrr:
   reg_lamba: 1
   eps: 0.2
   gamma: 1
+lr: 0.1
+recon_lamba: 100

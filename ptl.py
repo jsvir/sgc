@@ -14,11 +14,11 @@ from torchvision import transforms
 from torchvision.datasets import MNIST
 
 from func import cluster_match, cluster_merge_match, normalized_mutual_info_score, adjusted_rand_score
-from loss import MaximalCodingRateReduction
-from model import AutoEncoder, RBFLayer, Gumble_Softmax, STGLayer, SubspaceClusterNetwork
+from loss import MaximalCodingRateReduction, TotalCodingRate
+from model import AutoEncoder, RBFLayer, Gumble_Softmax, STGLayer, SubspaceClusterNetwork, ClusterLayer, STGLayerAE, DimReduction, SelectLayer, Decoder
 
 __all__ = [
-    "CKMMNIST", "CKMFSMNIST", "CMRRMNIST"
+    "CKMMNIST", "CKMFSMNIST", "MCRRMNIST", "CKMShallowMNIST"
 ]
 
 class BaseModule(LightningModule):
@@ -99,32 +99,83 @@ class MNISTModule(BaseModule):
 class CMRRModule(BaseModule):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.cluster_net = SubspaceClusterNetwork(cfg)
+        self.ae = AutoEncoder(cfg)
+        self.cluster_net = ClusterLayer(cfg)
         self.mcrr_loss = MaximalCodingRateReduction(eps=cfg.mcrr.eps, gamma=cfg.mcrr.gamma)
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
         x = x.reshape(x.size(0), -1)
-        z, logits = self.cluster_net(x)
-        prob = Gumble_Softmax(self.tau())(logits)
-        class_discrimn_loss, class_compress_loss = self.mcrr_loss(z, prob, num_classes=self.cfg.n_clusters)
-        self.log('train/cmrr_discrim_loss', -class_discrimn_loss.item())
-        self.log('train/cmrr_compress_loss', class_compress_loss.item())
-        loss = -class_discrimn_loss + self.cfg.mcrr.reg_lamba * class_compress_loss
-        return loss
+        z, recon_x = self.ae(x)
+        z, logits = self.cluster_net(z)
+        if self.current_epoch < self.cfg.ae_pretrain_epochs:
+            loss = F.l1_loss(x, recon_x)
+            self.log('ae/recon_loss', loss.item())
+            return loss
+        else:
+            ae_loss = F.l1_loss(recon_x, x)
+            prob = Gumble_Softmax(self.tau())(logits)
+            class_discrimn_loss, class_compress_loss = self.mcrr_loss(z, prob, num_classes=self.cfg.n_clusters)
+            self.log('train/cmrr_discrim_loss', -class_discrimn_loss.item())
+            self.log('train/cmrr_compress_loss', class_compress_loss.item())
+            self.log('train/recon_loss', ae_loss.item())
+            loss = - class_discrimn_loss + self.cfg.mcrr.reg_lamba * class_compress_loss + self.cfg.recon_lamba * ae_loss
+            return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         x = x.reshape(x.size(0), -1)
-        z, logits = self.cluster_net(x)
+        z, recon_x = self.ae(x)
+        z, logits = self.cluster_net(z)
         y_hat = torch.argmax(logits, dim=1)
         self.val_cluster_list.append(y_hat.cpu())
         self.val_label_list.append(y.cpu())
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(chain(self.cluster_net.parameters()), lr=self.cfg.lr)
-        sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
-        return [opt], [sch]
+        opt = torch.optim.Adam(chain(self.ae.parameters(), self.cluster_net.parameters()), lr=self.cfg.lr)
+        # sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
+        return [opt] #, [sch]
+
+
+class MCRRModule(BaseModule):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.ae = AutoEncoder(cfg)
+        self.cluster_net = ClusterLayer(cfg)
+        self.mcrr_loss = MaximalCodingRateReduction(eps=cfg.mcrr.eps, gamma=cfg.mcrr.gamma)
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        x = x.reshape(x.size(0), -1)
+        z, recon_x = self.ae(x)
+        z, logits = self.cluster_net(z)
+        if self.current_epoch < self.cfg.ae_pretrain_epochs:
+            loss = F.l1_loss(x, recon_x)
+            self.log('ae/recon_loss', loss.item())
+            return loss
+        else:
+            ae_loss = F.l1_loss(recon_x, x)
+            prob = Gumble_Softmax(self.tau())(logits)
+            class_discrimn_loss, class_compress_loss = self.mcrr_loss(z, prob, num_classes=self.cfg.n_clusters)
+            self.log('train/cmrr_discrim_loss', -class_discrimn_loss.item())
+            self.log('train/cmrr_compress_loss', class_compress_loss.item())
+            self.log('train/recon_loss', ae_loss.item())
+            loss = - class_discrimn_loss + self.cfg.mcrr.reg_lamba * class_compress_loss + self.cfg.recon_lamba * ae_loss
+            return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        x = x.reshape(x.size(0), -1)
+        z, recon_x = self.ae(x)
+        z, logits = self.cluster_net(z)
+        y_hat = torch.argmax(logits, dim=1)
+        self.val_cluster_list.append(y_hat.cpu())
+        self.val_label_list.append(y.cpu())
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(chain(self.ae.parameters(), self.cluster_net.parameters()), lr=self.cfg.lr)
+        # sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
+        return [opt] #, [sch]
 
 
 class CKMModule(BaseModule):
@@ -169,52 +220,100 @@ class CKMModule(BaseModule):
         return [opt], [sch]
 
 
-class CKMFS(CKMModule):
+class CKMShallowModule(BaseModule):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.stg = STGLayer(cfg)
+        self.clustering_layer = RBFLayer(cfg)
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
         x = x.reshape(x.size(0), -1)
-        if self.current_epoch < self.cfg.ae_pretrain_epochs:
-            embs, recon_x = self.ae(x)
-            loss = F.l1_loss(x, recon_x)
-            self.log('ae/recon_loss', loss.item())
-            return loss
-        else:
-            if self.current_epoch > self.cfg.stg.start_reg_after_epoch:
-                gated_x, h = self.stg(x, train=True)
-                embs, recon_x = self.ae(gated_x)
-                ae_loss = F.l1_loss(gated_x, recon_x)
-                reg_loss = self.stg.regularization(h)
-                loss = reg_loss + ae_loss
-                self.log('train/reg_loss', reg_loss.item())
-            else:
-                embs, recon_x = self.ae(x)
-                ae_loss = F.l1_loss(x, recon_x)
-                loss = ae_loss
-
-            if not self.clustering_layer.initialized:
-                self.clustering_layer.init_centroids(embs)
-            probs = self.clustering_layer(embs)
-            gumble_probs = Gumble_Softmax(self.tau(), straight_through=True)(probs)
-            ckm_loss = F.l1_loss(gumble_probs @ self.clustering_layer.centroids, embs)
-            loss += self.cfg.ckm.reg_lamba * ckm_loss
-            self.log('train/ckm_loss', ckm_loss.item())
-            self.log('train/recon_loss', ae_loss.item())
-
-            return loss
+        if not self.clustering_layer.initialized:
+            self.clustering_layer.init_centroids(x)
+        probs = self.clustering_layer(x)
+        gumble_probs = Gumble_Softmax(self.tau(), straight_through=True)(probs)
+        ckm_loss = F.l1_loss(gumble_probs @ self.clustering_layer.centroids, x)
+        loss = self.cfg.ckm.reg_lamba * ckm_loss
+        self.log('train/loss', loss.item())
+        self.log('train/ckm_loss', ckm_loss.item())
+        return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         x = x.reshape(x.size(0), -1)
-        if self.current_epoch > self.cfg.stg.start_reg_after_epoch:
-            gated_x, h = self.stg(x, train=False)
-            z, _ = self.ae(gated_x)
-        else:
-            z, _ = self.ae(x)
-        probs = self.clustering_layer(z).exp()
+        probs = self.clustering_layer(x).exp()
+        y_hat = torch.argmax(probs, dim=1)
+        self.val_cluster_list.append(y_hat.cpu())
+        self.val_label_list.append(y.cpu())
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(self.clustering_layer.parameters(), lr=self.cfg.lr)
+        sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
+        return [opt], [sch]
+
+
+class CKMFS(CKMShallowModule):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.stg = STGLayer(cfg)
+        self.mcrr_loss = MaximalCodingRateReduction(eps=0.1, gamma=1)
+        # self.dim_reduction = DimReduction(cfg)
+        self.discrimin_loss = TotalCodingRate()
+        self.feats_selector = SelectLayer(cfg)
+        self.feats_decoder = Decoder(cfg)
+
+
+    def training_step(self, batch, batch_idx):
+        x, _ = batch
+        x = x.reshape(x.size(0), -1)
+        gated_x, h = self.stg(x, train=True)
+        selected_feats, weights = self.feats_selector(gated_x, self.current_epoch)
+        # embs = self.dim_reduction(gated_x)   # linear transform
+        if not self.clustering_layer.initialized:
+            self.clustering_layer.init_centroids(selected_feats)
+        # reg_loss = self.stg.regularization(h)
+        log_probs = self.clustering_layer(selected_feats)
+        # probs = Gumble_Softmax(self.tau())(log_probs)
+        # gumble_probs = Gumble_Softmax(self.tau(), straight_through=True)(log_probs)
+        # gated_x = F.normalize(gated_x, p=2)
+        # assigments = F.normalize(gumble_probs @ self.clustering_layer.centroids, p=2)
+        # ckm_loss = - F.cosine_similarity(assigments, gated_x).mean()
+        # ckm_loss = - torch.cosine_similarity(F.normalize(gumble_probs @ self.clustering_layer.centroids), F.normalize(embs)).mean()
+        # ckm_loss = F.mse_loss(gumble_probs @ self.clustering_layer.centroids, selected_feats)
+        discrimn_loss, compress_loss = self.mcrr_loss(selected_feats, log_probs.exp(), num_classes=self.cfg.n_clusters)
+        selected_feats, weights = self.feats_selector(gated_x, self.current_epoch)
+        gated_recon = self.feats_decoder(selected_feats)
+        gted_recon_loss = F.mse_loss(gated_recon, gated_x)
+
+        # if batch_idx % 2 == 0:
+        #     ckm_loss = F.l1_loss(gumble_probs.detach() @ self.clustering_layer.centroids, embs.detach())
+        # else:
+        #     ckm_loss = F.l1_loss(gumble_probs @ self.clustering_layer.centroids.detach(), embs)
+
+        # discrimn_loss, compress_loss = self.mcrr_loss(embs, probs, num_classes=self.cfg.n_clusters)
+        self.log('train/discrim_loss', -discrimn_loss.item())
+        self.log('train/compress_loss', compress_loss.item())
+
+        # self.log('train/centoroids_batch_norm', self.clustering_layer.centroids.norm(dim=1).mean())
+        # loss = self.cfg.ckm.reg_lamba * ckm_loss + (class_compress_loss - class_discrimn_loss) / self.cfg.batch_size
+        # loss = ckm_loss + (0.1 * class_compress_loss - class_discrimn_loss)
+        loss = 10*gted_recon_loss + 0.1 * (- discrimn_loss + 0.1 * compress_loss)
+        # if self.current_epoch > 20:
+        #     loss += 0.01 * ckm_loss #+ reg_loss #+ 0.01 * compress_loss  - 0.1 * discrimn_loss
+        # self.log('train/ckm_loss', ckm_loss.item())
+        self.log('train/open_gates', self.stg.num_open_gates(x))
+        # self.log('train/reg_loss', reg_loss.item())
+        self.log('train/gted_recon_loss', gted_recon_loss.item())
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        x = x.reshape(x.size(0), -1)
+        gated_x, h= self.stg(x, train=False)
+        selected_feats, _ = self.feats_selector(gated_x)
+        # embs = self.dim_reduction(gated_x)
+        probs = self.clustering_layer(selected_feats).exp()
         y_hat = torch.argmax(probs, dim=1)
         self.val_cluster_list.append(y_hat.cpu())
         self.val_label_list.append(y.cpu())
@@ -225,9 +324,9 @@ class CKMFS(CKMModule):
         # sch1 = lr_scheduler.CosineAnnealingLR(opt1, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
         # sch2 = lr_scheduler.CosineAnnealingLR(opt2, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
         # return [opt1, opt2], [sch1, sch2]
-        opt = torch.optim.Adam(chain(self.ae.parameters(), self.clustering_layer.parameters(), self.stg.parameters()), lr=self.cfg.lr)
-        sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
-        return [opt], [sch]
+        opt = torch.optim.Adam(chain(self.clustering_layer.parameters(), self.stg.parameters(), self.feats_decoder.parameters(), self.feats_selector.parameters()), lr=self.cfg.lr)
+        # sch = lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs, eta_min=1e-5, last_epoch=-1)
+        return [opt] #, [sch]
 
 
 class CKMMNIST(CKMModule, MNISTModule):
@@ -240,6 +339,11 @@ class CKMFSMNIST(CKMFS, MNISTModule):
         super().__init__(cfg)
 
 
-class CMRRMNIST(CMRRModule, MNISTModule):
+class MCRRMNIST(MCRRModule, MNISTModule):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+
+
+class CKMShallowMNIST(CKMShallowModule, MNISTModule):
     def __init__(self, cfg):
         super().__init__(cfg)
