@@ -1,6 +1,7 @@
 base_cfg: cfg/mnist/common.yaml
 clustering: MCRR
 ae:
+  latent_dim: 128
   encoder:
     - 1024
     - 512
@@ -9,12 +10,16 @@ ae:
     - 256
     - 512
     - 1024
-cluster:
-    - 1024
 
+cluster:
+  layers:
+    - 1024
+  input_dim: 128
+
+ae_pretrain_epochs: 10
 mcrr:
   reg_lamba: 1
-  eps: 0.2
+  eps: 0.001
   gamma: 1
-lr: 0.1
+
 recon_lamba: 100

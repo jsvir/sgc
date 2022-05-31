@@ -3,16 +3,23 @@ clustering: CKMFS
 
 stg:
   sigma: 0.5
-  reg_lamba: .1
-  hidden_dim: 64
+  reg_lamba: 1.
+  hidden_dim: 128
+  enabled: true
 
 ckm:
   reg_lamba: 1e-2
-  centroid_dim: 10
+  centroid_dim: 784
 
-selector:
-  k_selected: 10
+mcrr:
+  reg_lamba: 1
+  eps: 0.01
+  gamma: 0.1
   hidden_dim: 128
-  start_temp: 10
-  min_temp: 1e-2
+
+#selector:
+#  k_selected: 10
+#  hidden_dim: 128
+#  start_temp: 10
+#  min_temp: 1e-2
 

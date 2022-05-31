@@ -1,5 +1,5 @@
 base_cfg: cfg/mnist/common.yaml
-clustering: CKMFS2
+clustering: CC
 ae_pretrain_epochs: 20
 ae:
   latent_dim: 10
@@ -14,9 +14,16 @@ ae:
 
 stg:
   sigma: 0.5
-  reg_lamba: 0.01
+  reg_lamba: 1.
   hidden_dim: 128
+  enabled: true
 
 ckm:
   reg_lamba: 1e-2
   centroid_dim: 10
+
+mcrr:
+  reg_lamba: 1
+  eps: 0.1
+  gamma: 0.1
+  hidden_dim: 128

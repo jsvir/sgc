@@ -2,21 +2,24 @@ dataset: MNIST
 
 data_dir: D:/data/mode_seeking/mnist_tcr
 input_dim: 784
-n_clusters: 10
-batch_size: 256
+n_clusters: 2
+batch_size: 1024
 lr: 1e-3
-ae_pretrain_epochs: 10
-repitions: 1
+wd: 1e-6
+repitions: 10
 
-tau_min: 1e-3
-tau_max: 1e3
+tau_min: 100
+tau_max: 100
 tau_sched: exponential
+
+activation: tanh
+init_weights: true
 
 trainer:
   gpus: 1
   auto_select_gpus: True
-  max_epochs: 1000
-  progress_bar_refresh_rate: 20
+  max_epochs: 300
+  progress_bar_refresh_rate: 10
   deterministic: True
   logger: True
   log_every_n_steps: 10

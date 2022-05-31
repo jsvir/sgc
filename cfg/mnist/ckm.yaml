@@ -1,6 +1,8 @@
 base_cfg: cfg/mnist/common.yaml
 clustering: CKM
+ae_pretrain_epochs: 10
 ae:
+  latent_dim: 10
   encoder:
     - 1024
     - 512

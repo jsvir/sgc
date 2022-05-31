@@ -1,9 +1,9 @@
 import math
 
 import torch
+import torch.nn.functional as F
 from sklearn.cluster import KMeans
 from torch import nn
-import torch.nn.functional as F
 
 
 class DenseBlock(torch.nn.Module):
@@ -25,12 +25,12 @@ class AutoEncoder(torch.nn.Module):
         self.encoder = [DenseBlock(cfg.input_dim, cfg.ae.encoder[0])]
         for i in range(len(cfg.ae.encoder)):  # 1024, 512, 256, 10
             if i == len(cfg.ae.encoder) - 1:
-                self.encoder.append(nn.Linear(cfg.ae.encoder[i], cfg.n_clusters))
+                self.encoder.append(nn.Linear(cfg.ae.encoder[i], cfg.ae.latent_dim))
             else:
                 self.encoder.append(DenseBlock(cfg.ae.encoder[i], cfg.ae.encoder[i + 1]))
         self.encoder = nn.Sequential(*self.encoder)
 
-        self.decoder = [DenseBlock(cfg.n_clusters, cfg.ae.decoder[0])]
+        self.decoder = [DenseBlock(cfg.ae.latent_dim, cfg.ae.decoder[0])]
         for i in range(len(cfg.ae.decoder)):  # 10, 256, 512, 1024
             if i == len(cfg.ae.decoder) - 1:
                 self.decoder.append(nn.Linear(cfg.ae.decoder[i], cfg.input_dim))
@@ -53,21 +53,16 @@ class RBFLayer(nn.Module):
         self.n_clusters = cfg.n_clusters
         self.in_features = cfg.ckm.centroid_dim
         self.out_features = cfg.n_clusters
-        self._centroids = nn.Parameter(torch.Tensor(self.out_features, self.in_features), requires_grad=True)
-        self.sigmas = nn.Parameter(torch.Tensor(self.out_features), requires_grad=True)
-        self.reset_parameters()
+        self._centroids = nn.Parameter(torch.randn(self.out_features, self.in_features), requires_grad=True)
+        self.sigma = nn.Parameter(torch.ones(self.out_features), requires_grad=True)
         self._initialized = False
 
-    def reset_parameters(self):
-        nn.init.normal_(self._centroids, 0, 1)
-        nn.init.constant_(self.sigmas, 1)
-
-    def forward(self, x):
+    def forward(self, x, tau=None):
         " the ouput is log probability of instance x_j to be assigned to cluster c_i"
-        size = (x.size(0), self.out_features, self.in_features)
-        x = x.unsqueeze(1).expand(size)
-        c = self._centroids.unsqueeze(0).expand(size)
-        distances = - (x - c).pow(2).sum(-1) / self.sigmas.unsqueeze(0).pow(2)
+        x = x.unsqueeze(1).repeat(1, self.out_features, 1)
+        c = self._centroids.unsqueeze(0).repeat(x.size(0), 1, 1)
+        distances = - (x - c).pow(2).sum(-1) * self.sigma.pow(-2).unsqueeze(0)
+        if tau is not None: distances /= tau
         return torch.log_softmax(distances, dim=-1)
 
     @property
@@ -80,7 +75,7 @@ class RBFLayer(nn.Module):
 
     def init_centroids(self, embeddings):
         kmeans = KMeans(n_clusters=self.n_clusters, init='k-means++', n_init=100, random_state=0).fit(embeddings.detach().cpu().numpy())
-        self._centroids.__init__(torch.tensor(kmeans.cluster_centers_.T, device=embeddings.device), requires_grad=True)
+        self._centroids.__init__(torch.tensor(kmeans.cluster_centers_, device=embeddings.device), requires_grad=True)
         self._initialized = True
 
 
@@ -120,6 +115,108 @@ class STGLayer(torch.nn.Module):
             return gates.mean()
         elif reduction == 'sum':
             return gates.sum()
+
+
+class SelfAttention(torch.nn.Module):
+    def __init__(self, cfg):
+        super(SelfAttention, self).__init__()
+        self.emb_dim = 512
+        self.heads = 2
+        self.multihead_attn = nn.MultiheadAttention(self.emb_dim, self.heads, batch_first=True)
+        self.norm_layer = nn.LayerNorm(self.emb_dim)
+        self.embed = nn.Linear(1, self.emb_dim)
+        self.output = nn.Linear(self.emb_dim, 1)
+
+    def forward(self, x):
+        v = self.embed(x.reshape(-1, 1)).reshape(-1, x.size(1), self.emb_dim)
+        v = self.norm_layer(v)
+        attn_output, attn_output_weights = self.multihead_attn(query=v, key=v, value=v)
+        return attn_output.squeeze(-1)
+
+
+class STGLayerExt(torch.nn.Module):
+    " Feature selection layer as in the paper: https://arxiv.org/abs/2106.06468"
+
+    def __init__(self, cfg):
+        super(STGLayerExt, self).__init__()
+        self.cfg = cfg
+        self._sqrt_2 = math.sqrt(2)
+        self.sigma = cfg.stg.sigma
+        self.reg_lamba = cfg.stg.reg_lamba
+        activation = nn.ReLU() if cfg.activation == 'relu' else nn.Tanh()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(cfg.input_dim, cfg.stg.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(cfg.stg.hidden_dim, cfg.input_dim),
+            nn.Tanh()
+        )
+        self.embedding_layer = nn.Sequential(
+            nn.Linear(cfg.input_dim, cfg.mcrr.hidden_dim),
+            nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+            activation,
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
+        )
+
+        self.clustering_layer = nn.Sequential(
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
+            nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+            activation,
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.n_clusters),
+        )
+        #TODO: checking if it's useful
+        if cfg.init_weights:
+            self.net.apply(self.init_weights)
+            self.embedding_layer.apply(self.init_weights)
+            self.clustering_layer.apply(self.init_weights)
+
+        #TODO: define an attention layer and for each cluster choose the emb that has maximal att score for the cluster
+        # the attention matrix is calculated for each cluster separately
+
+        # self.att = SelfAttention()
+
+    @staticmethod
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.normal_(m.weight, std=0.1)
+            m.bias.data.fill_(0.0)
+
+    def forward(self, x, pretrain=False, gated_x=False, epoch=None):
+        if pretrain or (not self.cfg.stg.enabled):
+            c = self.embedding_layer(x)
+            logits = self.clustering_layer(c)
+            return c, logits
+        else:
+            # if epoch is not None:
+            #     std = 0.1 + 0.9 * min(epoch/10, 1)
+            # else: std = 1
+            noise = torch.normal(mean=0, std=1., size=x.size(), device=x.device)
+            h = self.net(x)
+            z = h + self.sigma * noise * self.training
+            stochastic_gate = self.hard_sigmoid(z)
+            new_x = x * stochastic_gate
+            c = self.embedding_layer(new_x)
+            logits = self.clustering_layer(c)
+            if gated_x: return h, c, logits, new_x
+            else: return h, c, logits
+
+    def hard_sigmoid(self, x):
+        return torch.clamp(x + self.sigma, 0.0, 1.0)
+
+    def regularization(self, h):
+        return self.reg_lamba * torch.mean(0.5 - 0.5 * torch.erf((-1 / 2 - h) / (self.sigma * self._sqrt_2)))
+
+    def get_gates(self, x):
+        with torch.no_grad():
+            gates = self.hard_sigmoid(self.net(x))
+            gates[x==x.min()] = 0
+        return gates
+
+    def num_open_gates(self, x, reduction='mean'):
+        if reduction == 'mean':
+            return self.get_gates(x).mean()
+        elif reduction == 'sum':
+            return self.get_gates(x).sum()
 
 
 class STGLayerAE(torch.nn.Module):
@@ -198,7 +295,7 @@ class SubspaceClusterNetwork(nn.Module):
         super().__init__()
         # the same encoder as in ae
         self.backbone = [DenseBlock(cfg.input_dim, cfg.ae.encoder[0])]
-        for i in range(len(cfg.ae.encoder)-1):
+        for i in range(len(cfg.ae.encoder) - 1):
             self.backbone.append(DenseBlock(cfg.ae.encoder[i], cfg.ae.encoder[i + 1]))
         self.backbone = nn.Sequential(*self.backbone)
         self.cluster = nn.Linear(cfg.ae.encoder[-1], cfg.n_clusters)
@@ -214,8 +311,8 @@ class ClusterLayer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.layers = nn.Sequential(
-            DenseBlock(cfg.n_clusters, cfg.cluster[0]),
-            nn.Linear(cfg.cluster[0], cfg.n_clusters)
+            DenseBlock(cfg.cluster.input_dim, cfg.cluster.layers[0]),
+            nn.Linear(cfg.cluster.layers[0], cfg.n_clusters)
         )
 
     def forward(self, z):
@@ -224,17 +321,9 @@ class ClusterLayer(nn.Module):
         return z, logits
 
 
-class DimReduction(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.layer = nn.Linear(cfg.input_dim, cfg.n_clusters, bias=False)
-
-    def forward(self, x):
-        return self.layer(x)
-
-
 class SelectLayer(nn.Module):
     """ from github.com/jsvir/lscae"""
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -275,6 +364,7 @@ class SelectLayer(nn.Module):
     def get_selected_feats(self):
         feats = torch.argmax(self.logits, dim=0)
         return feats
+
 
 class Decoder(nn.Module):
     def __init__(self, cfg):

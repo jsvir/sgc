@@ -2,7 +2,6 @@
 Author: https://github.com/zengyi-li/NMCE-release/blob/main/NMCE/func.py
 """
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -10,7 +9,6 @@ from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
 import torchvision
 
 
-# import torch.nn
 def set_gamma(loss_fn, epoch, total_epoch=500, warmup_epoch=100, gamma_min=0., gamma_max=1.0):
     warmup_start = total_epoch - warmup_epoch
     warmup_end = total_epoch
@@ -64,7 +62,7 @@ def cluster_match(cluster_mtx, label_mtx, n_classes=10, print_result=True):
         max_count = torch.stack(max_count_list)
         assigned_label_list.append(max_label[max_count.argmax()])
         assigned_count.append(max_count.max())
-        cluster_indx.pop(max_count.argmax())
+        cluster_indx.pop(max_count.argmax().item())
     total_correct = torch.tensor(assigned_count).sum().item()
     total_sample = cluster_mtx.shape[0]
     acc = total_correct / total_sample
@@ -79,9 +77,9 @@ def cluster_merge_match(cluster_mtx, label_mtx, print_result=True):
     n_correct = 0
     for cluster_id in cluster_indx:
         label_elements, counts = label_mtx[cluster_mtx == cluster_id].unique(return_counts=True)
-        n_correct += counts.max()
+        n_correct += counts.max().item()
     total_sample = len(cluster_mtx)
-    acc = n_correct.item() / total_sample
+    acc = n_correct / total_sample
     if print_result:
         print('{}/{} ({}%) correct'.format(n_correct, total_sample, acc * 100))
     else:
@@ -109,7 +107,7 @@ def cluster_acc(test_loader, net, device, print_result=False, save_name_img='clu
     label_mtx = torch.cat(label_list, dim=0)
     x_mtx = torch.cat(x_list, dim=0)
     z_mtx = torch.cat(z_list, dim=0)
-    _, _, acc_single = cluster_match(cluster_mtx, label_mtx, n_classes=label_mtx.max() + 1, print_result=False)
+    _, _, acc_single = cluster_match(cluster_mtx, label_mtx, n_classes=label_mtx.max().item() + 1, print_result=False)
     _, _, acc_merge = cluster_merge_match(cluster_mtx, label_mtx, print_result=False)
     NMI = normalized_mutual_info_score(label_mtx.numpy(), cluster_mtx.numpy())
     ARI = adjusted_rand_score(label_mtx.numpy(), cluster_mtx.numpy())

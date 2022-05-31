@@ -1,0 +1,19 @@
+base_cfg: cfg/mnist/common.yaml
+clustering: MCRRFS
+ae_pretrain_epochs: 20
+mcrr:
+  reg_lamba: 1
+  eps: 0.001
+  gamma: 1
+
+stg:
+  sigma: 0.5
+  reg_lamba: 0.01
+  hidden_dim: &stg_out 128
+
+cluster:
+  layers:
+    - 1024
+  input_dim: 784 #*stg_out
+
+recon_lamba: 100
