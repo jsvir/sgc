@@ -118,7 +118,7 @@ class STGLayer(torch.nn.Module):
 
 
 class SelfAttention(torch.nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg=None):
         super(SelfAttention, self).__init__()
         self.emb_dim = 512
         self.heads = 2
@@ -141,22 +141,29 @@ class STGLayerExt(torch.nn.Module):
         super(STGLayerExt, self).__init__()
         self.cfg = cfg
         self._sqrt_2 = math.sqrt(2)
-        self.sigma = cfg.stg.sigma
+        self._sigma = 0.5 #torch.nn.Parameter(torch.tensor(cfg.stg.sigma), requires_grad=True)
         self.reg_lamba = cfg.stg.reg_lamba
         activation = nn.ReLU() if cfg.activation == 'relu' else nn.Tanh()
         self.net = nn.Sequential(
             nn.Flatten(),
             nn.Linear(cfg.input_dim, cfg.stg.hidden_dim),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(cfg.stg.hidden_dim, cfg.input_dim),
             nn.Tanh()
         )
         self.embedding_layer = nn.Sequential(
-            nn.Linear(cfg.input_dim, cfg.mcrr.hidden_dim),
+            nn.Linear(cfg.ae.latent_dim, cfg.mcrr.hidden_dim),
             nn.BatchNorm1d(cfg.mcrr.hidden_dim),
             activation,
             nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
         )
+
+        # self.recon_layer = nn.Sequential(
+        #     nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
+        #     nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(cfg.mcrr.hidden_dim, cfg.input_dim),
+        # )
 
         self.clustering_layer = nn.Sequential(
             nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
@@ -164,16 +171,36 @@ class STGLayerExt(torch.nn.Module):
             activation,
             nn.Linear(cfg.mcrr.hidden_dim, cfg.n_clusters),
         )
+        self.classifier = nn.Sequential(
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
+            nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+            activation,
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.n_clusters),
+        )
+
+        self.embedding_layer2 = nn.Sequential(
+            nn.Linear(cfg.ae.latent_dim, cfg.mcrr.hidden_dim),
+            nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+            activation,
+            nn.Linear(cfg.mcrr.hidden_dim, cfg.mcrr.hidden_dim),
+        )
+        #
+        # self.clustering_layer2 = nn.Sequential(
+        #     nn.Linear(10, cfg.mcrr.hidden_dim),
+        #     nn.BatchNorm1d(cfg.mcrr.hidden_dim),
+        #     activation,
+        #     nn.Linear(cfg.mcrr.hidden_dim, cfg.n_clusters),
+        # )
+
         #TODO: checking if it's useful
         if cfg.init_weights:
-            self.net.apply(self.init_weights)
+            self.net.apply(self.init_fs_weights)
             self.embedding_layer.apply(self.init_weights)
             self.clustering_layer.apply(self.init_weights)
-
-        #TODO: define an attention layer and for each cluster choose the emb that has maximal att score for the cluster
-        # the attention matrix is calculated for each cluster separately
-
-        # self.att = SelfAttention()
+            self.classifier.apply(self.init_weights)
+            self.embedding_layer2.apply(self.init_weights)
+            # self.clustering_layer2.apply(self.init_weights)
+            # self.recon_layer.apply(self.init_weights)
 
     @staticmethod
     def init_weights(m):
@@ -181,35 +208,68 @@ class STGLayerExt(torch.nn.Module):
             torch.nn.init.normal_(m.weight, std=0.1)
             m.bias.data.fill_(0.0)
 
-    def forward(self, x, pretrain=False, gated_x=False, epoch=None):
+    @staticmethod
+    def init_fs_weights(m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.normal_(m.weight, std=0.01)
+            m.bias.data.fill_(0.0)
+
+    def forward(self, x, pretrain=False, extra=False, epoch=None):
         if pretrain or (not self.cfg.stg.enabled):
             c = self.embedding_layer(x)
             logits = self.clustering_layer(c)
             return c, logits
         else:
-            # if epoch is not None:
-            #     std = 0.1 + 0.9 * min(epoch/10, 1)
-            # else: std = 1
-            noise = torch.normal(mean=0, std=1., size=x.size(), device=x.device)
+            noise = torch.normal(mean=0, std=1., size=x.size(), generator=torch.Generator(device=x.device).manual_seed(0), device=x.device)
             h = self.net(x)
             z = h + self.sigma * noise * self.training
             stochastic_gate = self.hard_sigmoid(z)
             new_x = x * stochastic_gate
-            c = self.embedding_layer(new_x)
-            logits = self.clustering_layer(c)
-            if gated_x: return h, c, logits, new_x
-            else: return h, c, logits
+            # new_x = (new_x - 0.14608) / 0.32195   # 3,8
+            # new_x = (new_x - 0.1307) / 0.3081     # all mnist
+
+            # c = self.embedding_layer(new_x)
+            # logits = self.clustering_layer(c)
+
+            # c2 = self.embedding_layer2(new_x)
+            # logits2 = self.clustering_layer2(c2)
+
+            # recon = self.recon_layer(c2)
+            return h, new_x #, recon, c2, logits2
+            # else: return h, c, logits
+
+    @property
+    def sigma(self):
+        return self._sigma #torch.sigmoid(self._sigma)
 
     def hard_sigmoid(self, x):
+        # return torch.sigmoid(x + self.sigma)
         return torch.clamp(x + self.sigma, 0.0, 1.0)
 
     def regularization(self, h):
         return self.reg_lamba * torch.mean(0.5 - 0.5 * torch.erf((-1 / 2 - h) / (self.sigma * self._sqrt_2)))
 
+    def distance_regularization(self, h):
+        a = self.hard_sigmoid(h)
+        b = torch.roll(a, shifts=1, dims=1)
+        return torch.conv1d(a.unsqueeze(1), b.unsqueeze(1)).mean() / a.size(-1)
+
+    @staticmethod
+    def compute_dist_mat(X, Y=None):
+        if Y is None:
+            Y = X
+        dtype = X.data.type()
+        dist_mat = torch.zeros(size=(X.size(0), Y.size(0)), device=X.device).type(dtype)
+        for i, row in enumerate(X.split(1)):
+            r_v = row.expand_as(Y)
+            sq_dist = torch.sum((r_v - Y) ** 2, 1)
+            dist_mat[i] = sq_dist.view(1, -1)
+        return dist_mat
+
     def get_gates(self, x):
         with torch.no_grad():
             gates = self.hard_sigmoid(self.net(x))
-            gates[x==x.min()] = 0
+            # gates[x==x.min()] = 0
         return gates
 
     def num_open_gates(self, x, reduction='mean'):

@@ -4,7 +4,7 @@ data_dir: D:/data/mode_seeking/mnist_tcr
 input_dim: 784
 n_clusters: 2
 batch_size: 1024
-lr: 1e-3
+lr: .2
 wd: 1e-6
 repitions: 10
 
@@ -18,7 +18,7 @@ init_weights: true
 trainer:
   gpus: 1
   auto_select_gpus: True
-  max_epochs: 300
+  max_epochs: 500
   progress_bar_refresh_rate: 10
   deterministic: True
   logger: True

@@ -1,6 +1,6 @@
 base_cfg: cfg/mnist/common.yaml
 clustering: CC
-ae_pretrain_epochs: 20
+ae_pretrain_epochs: 100
 ae:
   latent_dim: 10
   encoder:
@@ -11,11 +11,12 @@ ae:
     - 256
     - 512
     - 1024
+  model_path: mnist_3_8_ae_latent_10.pth
 
 stg:
   sigma: 0.5
   reg_lamba: 1.
-  hidden_dim: 128
+  hidden_dim: 256
   enabled: true
 
 ckm:
@@ -27,3 +28,5 @@ mcrr:
   eps: 0.1
   gamma: 0.1
   hidden_dim: 128
+
+pseudo_label_thresh: 0.8 # cosine similarity
